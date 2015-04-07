@@ -2,9 +2,8 @@ import org.junit.Test;
 import play.libs.F;
 
 import java.io.IOException;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static org.fest.assertions.Assertions.assertThat;
@@ -38,6 +37,25 @@ public class CompletableFutureTest {
     }
 
     @Test
+    public void functionOnCompleteWithCheckedException() throws Exception {
+        final Function<String, Integer> f = s -> {
+            throw new CompletionException(new IOException("whatever"));
+        };
+        final CompletableFuture<Integer> firstFuture = CompletableFuture.completedFuture("hello").thenApply(f);
+        final CompletableFuture<Integer> followUp = new CompletableFuture<>();
+        firstFuture.whenComplete((value, e) -> {
+            if (value != null) {
+                followUp.complete(value);
+            } else {
+                //if you check here the class of the exception e, it will be CompletionException
+
+                followUp.completeExceptionally(e);
+            }
+        });
+        executionThrows(() -> followUp.get(), ExecutionException.class, IOException.class, "whatever");
+    }
+
+    @Test
     public void functionJoinWithCheckedException() throws Exception {
         final Function<String, Integer> f = s -> {
             throw new CompletionException(new IOException("whatever!"));
@@ -62,30 +80,61 @@ public class CompletableFutureTest {
         executionThrows(() -> promise.get(0), IOException.class, "whatever");//easier handling
     }
 
+    @Test
+    public void customTimeout() throws Exception {
+        //cache and don't forget to close
+        final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1);
+        final CompletionStage<String> stage = new CompletableFuture<>();
+        final CompletionStage<String> timeoutStage = withTimeout(stage, executor);
+        executionThrows(() -> timeoutStage.toCompletableFuture().get(), ExecutionException.class, TimeoutException.class, null);
+        executor.shutdown();
+    }
+
+    private <T> CompletionStage<T> withTimeout(final CompletionStage<T> stage, final ScheduledThreadPoolExecutor executor) {
+        //could be parameter of this method
+        final int delay = 2;
+        final TimeUnit timeUnit = TimeUnit.MILLISECONDS;
+
+        final CompletableFuture<T> future = new CompletableFuture<>();
+        stage.whenComplete((value, e) -> {
+            if (value != null) {
+                future.complete(value);
+            } else {
+                future.completeExceptionally(e);
+            }
+        });
+        executor.schedule(() -> future.completeExceptionally(new TimeoutException()), delay, timeUnit);
+
+        return future;
+    }
+
     private <T> void executionThrows(final SupplierWithThrows<T> supplier,
                                      final Class<? extends Exception> expectedExceptionClass,
                                      final Class<? extends Exception> expectedExceptionCauseClass,
                                      final String expectedMessage) {
+        extractException(supplier, e -> {
+            assertThat(e).isInstanceOf(expectedExceptionClass);
+            assertThat(e.getCause()).isInstanceOf(expectedExceptionCauseClass);
+            assertThat(e.getCause().getMessage()).isEqualTo(expectedMessage);
+        });
+    }
+
+    private <T> void extractException(final SupplierWithThrows<T> supplier, final Consumer<Exception> consumer) {
         try {
             supplier.get();
             throw new RuntimeException("should fail");
         } catch (final Exception e) {
-            assertThat(e).isInstanceOf(expectedExceptionClass);
-            assertThat(e.getCause()).isInstanceOf(expectedExceptionCauseClass);
-            assertThat(e.getCause().getMessage()).isEqualTo(expectedMessage);
+            consumer.accept(e);
         }
     }
 
     private <T> void executionThrows(final SupplierWithThrows<T> supplier,
                                      final Class<? extends Exception> expectedExceptionClass,
                                      final String expectedMessage) {
-        try {
-            supplier.get();
-            throw new RuntimeException("should fail");
-        } catch (final Exception e) {
+        extractException(supplier, e -> {
             assertThat(e).isInstanceOf(expectedExceptionClass);
             assertThat(e.getMessage()).isEqualTo(expectedMessage);
-        }
+        });
     }
 
     @FunctionalInterface
